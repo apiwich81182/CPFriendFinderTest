@@ -14,3 +14,4 @@ USER spring:spring
 ENV SPRING_PROFILES_ACTIVE=container SERVER_PORT=8080 PORT=3000 HOST=0.0.0.0 BACKEND_URL=http://127.0.0.1:8080
 EXPOSE 3000
 ENTRYPOINT ["/bin/sh","/app/container-start.sh"]
+

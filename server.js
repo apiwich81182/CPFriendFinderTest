@@ -10,6 +10,13 @@ const fs=require('node:fs'),path=require('node:path');
 function options(req){return {hostname:backend.hostname,port:backend.port||80,path:req.url,method:req.method,headers:{...req.headers,host:backend.host,'x-forwarded-host':req.headers.host,'x-forwarded-proto':req.headers['x-forwarded-proto']||'http'}};}
 const server=http.createServer((req,res)=>{
  const pathname=req.url.split('?')[0];
+ const storageOrigin=process.env.STORAGE_PROXY_URL;
+ if(pathname.startsWith('/media/')) {
+  if(!storageOrigin || !['GET','HEAD'].includes(req.method) || !/^\/media\/storage\/uploads\/[0-9a-f-]+\.(png|jpg|gif|webp)$/.test(pathname)) {res.writeHead(404);res.end();return;}
+  const target=new URL(pathname.slice('/media'.length),storageOrigin);
+  const proxy=http.request(target,{method:req.method},upstream=>{res.writeHead(upstream.statusCode,{'Content-Type':upstream.headers['content-type']||'application/octet-stream','Cache-Control':'public, max-age=86400','X-Content-Type-Options':'nosniff'});upstream.pipe(res);});
+  proxy.setTimeout(10000,()=>proxy.destroy());proxy.on('error',()=>{if(!res.headersSent)res.writeHead(502);res.end();});req.on('aborted',()=>proxy.destroy());proxy.end();return;
+ }
  const config=getIceStatus();
  if(pathname==='/turn-check'){res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});res.end(fs.readFileSync(path.join(__dirname,'turn-check.html')));return;}
  if(pathname==='/' && ['GET','HEAD'].includes(req.method)) {res.writeHead(302,{Location:'/login','Cache-Control':'no-store'});res.end();return;}
@@ -26,4 +33,4 @@ server.on('upgrade',(req,socket,head)=>{
  const opts=options(req);if(opts.headers.origin)opts.headers.origin=backend.origin;
  const upstream=http.request(opts);upstream.on('upgrade',(response,remote,remoteHead)=>{socket.write(`HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\n`+Object.entries(response.headers).map(([k,v])=>`${k}: ${v}\r\n`).join('')+'\r\n');if(head.length)remote.write(head);if(remoteHead.length)socket.write(remoteHead);remote.pipe(socket);socket.pipe(remote);socket.on('error',()=>remote.destroy());remote.on('error',()=>socket.destroy());socket.on('close',()=>remote.destroy());remote.on('close',()=>socket.destroy());});upstream.on('response',response=>{socket.end(`HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\nConnection: close\r\n\r\n`);response.resume();});upstream.on('error',()=>socket.destroy());upstream.end();
 });
-server.listen(port,'127.0.0.1',()=>console.log(`CPFriendFinder gateway: http://localhost:${port}`));
+server.listen(port,process.env.HOST||'0.0.0.0',()=>console.log(`CPFriendFinder gateway: http://localhost:${port}`));
