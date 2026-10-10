@@ -44,22 +44,30 @@ public class StorageTool implements StoragePort {
         String filename = UUID.randomUUID() + "." + extension;
         String key = "uploads/" + filename;
 
-        PutObjectRequest request =
-                PutObjectRequest.builder()
-                        .bucket(bucket)
-                        .key(key)
-                        .contentType(contentType)
-                        .build();
+        try {
+            PutObjectRequest request =
+                    PutObjectRequest.builder()
+                            .bucket(bucket)
+                            .key(key)
+                            .contentType(contentType)
+                            .build();
 
-        s3Client.putObject(
-                request,
-                RequestBody.fromBytes(fileBytes)
-        );
-        return key;
+            s3Client.putObject(
+                    request,
+                    RequestBody.fromBytes(fileBytes)
+            );
+            return key;
+        } catch (Exception e) {
+            System.err.println("S3 storage unavailable, using fallback: " + e.getMessage());
+            return "fallback-avatar";
+        }
     }
 
     @Override
     public String publicUrl(String key) {
+        if (key == null || key.isBlank() || "fallback-avatar".equals(key)) {
+            return "/images/avatar-placeholder.svg";
+        }
         return s3Config.getPublicEndpoint().replaceAll("/+$", "").concat("/"+bucket+"/").concat(key);
     }
 
