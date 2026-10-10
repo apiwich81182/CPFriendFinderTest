@@ -14,8 +14,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   let incomingSignal = null;
   let currentMode = null;
+  // Close the incoming screen if the caller's CANCEL never arrives (caller's own timeout is 40s).
+  const INCOMING_TIMEOUT_MS = 45000;
+  let incomingTimer = null;
 
   function closeCallUI() {
+    clearTimeout(incomingTimer); incomingTimer = null;
     overlay?.classList.remove("show");
     videoArea?.classList.remove("show");
 
@@ -27,12 +31,19 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   function showIncomingCall(signal) {
-    incomingSignal = signal;
+    // receivedAt lets /friend ignore a stale invite when it resumes the call after navigation.
+    incomingSignal = { ...signal, receivedAt: Date.now() };
+    const shown = incomingSignal;
+    clearTimeout(incomingTimer);
+    incomingTimer = setTimeout(() => {
+      if (incomingSignal !== shown) return;
+      console.warn("[global-call] สายเรียกเข้าหมดเวลา (ไม่มี CANCEL จากผู้โทร) → ปิดหน้าจอ");
+      closeCallUI();
+    }, INCOMING_TIMEOUT_MS);
     currentMode = signal.mode === "VIDEO" ? "VIDEO" : "VOICE";
 
     if (callerName) callerName.textContent = signal.fromName || "เพื่อน";
-    if (callerImage)
-      callerImage.src = signal.fromImage || "/images/avatar-placeholder.svg";
+    if (callerImage) callerImage.src = signal.fromImage || "/images/avatar-placeholder.svg";
 
     if (status) {
       status.textContent =
@@ -48,31 +59,37 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (!signal) return;
 
     if (signal.type === "INVITE") {
-      if (CPCall.isActive?.() || incomingSignal) return;
+      // Same invite delivered twice: keep ringing, don't decline our own pending call.
+      if (incomingSignal && String(incomingSignal.fromUserId) === String(signal.fromUserId) && String(incomingSignal.roomId) === String(signal.roomId)) return;
+      // Busy (in another call, or already ringing): decline right away so the caller is not left waiting.
+      if (CPCall.isActive?.() || CPCall.isBusy?.() || incomingSignal) { CPCall.declineFriendCall(signal).catch(error => console.warn("[global-call] DECLINE failed:", error)); return; }
       showIncomingCall(signal);
       return;
     }
 
     if (signal.type === "CANCEL") {
-      sessionStorage.removeItem("cp-pending-call");
-      if (
-        incomingSignal &&
-        String(signal.fromUserId) === String(incomingSignal.fromUserId)
-      ) {
-        closeCallUI();
-      }
-    }
+        sessionStorage.removeItem("cp-pending-call");
+        if (
+            incomingSignal &&
+            String(signal.fromUserId) === String(incomingSignal.fromUserId)
+        ) {
+            closeCallUI();
+        }
+        }
   });
 
-  acceptButton?.addEventListener("click", () => {
-    if (!incomingSignal) return;
+acceptButton?.addEventListener("click", () => {
+  if (!incomingSignal) return;
 
-    acceptButton.disabled = true;
-    declineButton.disabled = true;
-    sessionStorage.setItem("cp-pending-call", JSON.stringify(incomingSignal));
+  acceptButton.disabled = true;
+  declineButton.disabled = true;
+  sessionStorage.setItem(
+    "cp-pending-call",
+    JSON.stringify(incomingSignal),
+  );
 
-    window.location.href = "/friend";
-  });
+  window.location.href = "/friend";
+});
 
   declineButton?.addEventListener("click", async () => {
     if (!incomingSignal) return;
