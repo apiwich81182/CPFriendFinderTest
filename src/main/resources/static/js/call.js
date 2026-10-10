@@ -732,6 +732,7 @@
       try {
         const signal = JSON.parse(frame.body);
         log.info(`⬇ stomp call ${signal?.type}`, signal);
+        if (signal.type === "MEDIA") { publishPresenceMedia(); return; }
         window.dispatchEvent(new CustomEvent("cp-call-signal", { detail: signal }));
       }
       catch (error) { log.error("อ่าน incoming call ไม่ได้:", error, frame.body); }
