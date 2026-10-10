@@ -929,6 +929,18 @@ document.addEventListener("DOMContentLoaded", async () => {
   let ringTimer = null;
   let incomingTimer = null;
   function clearRingTimers() { clearTimeout(ringTimer); clearTimeout(incomingTimer); ringTimer = incomingTimer = null; }
+  // After entering the call room, end the call if nobody else shows up (caller gave up, CANCEL got lost).
+  const NO_PEER_TIMEOUT_MS = 20000;
+  let remotePeerCount = 0;
+  window.addEventListener("cp-call-streams", event => { remotePeerCount = Array.isArray(event.detail) ? event.detail.length : 0; });
+  function armNoPeerTimeout() {
+    const call = callInfo;
+    setTimeout(() => {
+      if (callInfo !== call || !CPCall.isActive() || remotePeerCount > 0) return;
+      console.warn("[friend] ไม่มีอีกฝ่ายเข้ามาในสายภายใน", NO_PEER_TIMEOUT_MS / 1000, "วินาที → วางสาย");
+      CPCall.leaveCall(); clearCallUI();
+    }, NO_PEER_TIMEOUT_MS);
+  }
 
   function callStatus(message) {
     if (currentCallMode === "VIDEO") { if (videoCallStatus) videoCallStatus.textContent = message; }
@@ -1072,6 +1084,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       await CPCall.acceptFriendCall(signal);
       if (incomingCallSignal !== signal) return;
       incomingCallSignal = null;
+      armNoPeerTimeout();
       showIncomingActions(false);
       callStatus("กำลังเชื่อมต่อ..."); syncCallControls();
     } catch (error) {
@@ -1121,7 +1134,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   window.addEventListener("cp-call-media-state", () => syncCallControls());
   window.addEventListener("cp-call-error", event => {
     callStatus(event.detail?.message || "การเชื่อมต่อขาดหาย");
-    if (event.detail?.reason !== "media-failed" || !CPCall.isActive() || !callInfo || mediaFailTimer) return;
+    const mediaFailed = event.detail?.reason === "media-failed" || event.detail?.message === "เชื่อมต่อสื่อไม่สำเร็จ กรุณาลองโทรใหม่";
+    if (!mediaFailed || !CPCall.isActive() || !callInfo || mediaFailTimer) return;
     const failedCall = callInfo;
     mediaFailTimer = setTimeout(() => {
       mediaFailTimer = null;
@@ -1144,7 +1158,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (incomingCallSignal || CPCall.isActive()) return;
       clearRingTimers();
       const accepted = callInfo;
-      try { await CPCall.joinRoomCall(callInfo.roomId, signal.mode || currentCallMode); callStatus("กำลังเชื่อมต่อ..."); syncCallControls(); }
+      try { await CPCall.joinRoomCall(callInfo.roomId, signal.mode || currentCallMode); callStatus("กำลังเชื่อมต่อ..."); syncCallControls(); armNoPeerTimeout(); }
       catch (error) {
         // User hung up while we were connecting: clearCallUI() already ran, nothing to report.
         if (callInfo !== accepted) return;
@@ -1194,6 +1208,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && !CPCall.isActive() && !acceptingCall && currentCallMode) closeOrDecline();
+  });
+  // Closing / refreshing the tab while the call is not connected yet: stop the other side ringing.
+  // beforeunload fires before call.js's pagehide handler (which closes the STOMP socket).
+  // Mobile browsers may skip beforeunload; the ring timeouts cover that case.
+  window.addEventListener("beforeunload", () => {
+    if (!callInfo || CPCall.isActive()) return;
+    const type = incomingCallSignal ? "DECLINE" : "CANCEL";
+    CPCall.wsPublish("/app/call", { type, toUserId: callInfo.friendId, roomId: callInfo.roomId });
   });
   window.addEventListener("pagehide", () => { disconnectRoomWebSocket(); CPCall.leaveCall(); stopCallTimer(); });
 
