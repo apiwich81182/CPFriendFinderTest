@@ -426,7 +426,7 @@
       const state = pc.connectionState;
       (state === "failed" ? log.error : state === "disconnected" ? log.warn : log.info)(`${tag} connectionState → ${state}`);
       if (state === "connected") { logSelectedRoute(entry); window.dispatchEvent(new CustomEvent("cp-call-connected", { detail: { userId: entry.userId || key, mode: currentMode } })); }
-      if (state === "failed") window.dispatchEvent(new CustomEvent("cp-call-error", { detail: { message: "เชื่อมต่อสื่อไม่สำเร็จ กรุณาลองโทรใหม่", reason: "media-failed", userId: entry.userId || key } }));
+      if (state === "failed") window.dispatchEvent(new CustomEvent("cp-call-error", { detail: { message: "เชื่อมต่อสื่อไม่สำเร็จ กรุณาลองโทรใหม่" } }));
     };
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
@@ -573,18 +573,6 @@
     wsPublish(`/app/rooms/${roomId}/call`, { type: "JOIN" }); // presence only
     publishPresenceMedia();
   }
-  // Friend calls only: if nobody else is in the room shortly after we enter it
-  // (caller gave up, CANCEL got lost, the other tab closed), end the call instead of waiting forever.
-  const NO_PEER_TIMEOUT_MS = 20000;
-  function armNoPeerTimeout(roomId) {
-    if (!currentCallFriendId) return;
-    const generation = mediaGeneration;
-    setTimeout(() => {
-      if (generation !== mediaGeneration || !activeCall || String(currentRoomId) !== String(roomId) || peers.size > 0) return;
-      log.warn(`no one joined room ${roomId} within ${NO_PEER_TIMEOUT_MS / 1000}s → ending call`);
-      window.dispatchEvent(new CustomEvent("cp-call-ended", { detail: { userId: currentCallFriendId, reason: "NO_PEER" } }));
-    }, NO_PEER_TIMEOUT_MS);
-  }
   async function joinRoomCall(roomId, mode) {
     if (!roomId) throw new Error("ไม่พบ roomId");
     await loadMe();
@@ -593,7 +581,6 @@
     try {
       await startMedia(mode);
       await enterCallRoom(roomId, generation);
-      armNoPeerTimeout(roomId);
     } catch (error) { if (generation === mediaGeneration) leaveCall(false); throw error; }
   }
   function leaveCall(notifyPeer = true) {
@@ -707,7 +694,6 @@
       // Join the signaling room before ACCEPT so the caller finds us when it joins.
       await enterCallRoom(signal.roomId, generation);
       publish("/app/call", { type: "ACCEPT", toUserId: signal.fromUserId, roomId: signal.roomId, mode: currentMode });
-      armNoPeerTimeout(signal.roomId);
     } catch (error) { if (generation === mediaGeneration) leaveCall(false); throw error; }
   }
   async function declineFriendCall(signal) {
@@ -732,21 +718,12 @@
       try {
         const signal = JSON.parse(frame.body);
         log.info(`⬇ stomp call ${signal?.type}`, signal);
-        if (signal.type === "MEDIA") { publishPresenceMedia(); return; }
         window.dispatchEvent(new CustomEvent("cp-call-signal", { detail: signal }));
       }
       catch (error) { log.error("อ่าน incoming call ไม่ได้:", error, frame.body); }
     });
   }
-  window.addEventListener("pagehide", () => {
-    log.info("pagehide → leaving call and closing sockets");
-    // Still ringing (not connected yet): tell the other side to stop ringing. Best effort — the
-    // ring timeouts in friend.js / global-call.js cover the case where this message is lost.
-    if (currentCallFriendId && currentRoomId && !activeCall) {
-      wsPublish("/app/call", { type: "CANCEL", toUserId: currentCallFriendId, roomId: currentRoomId });
-    }
-    leaveCall(); stompClient?.deactivate(); signalSocket?.disconnect();
-  });
+  window.addEventListener("pagehide", () => { log.info("pagehide → leaving call and closing sockets"); leaveCall(); stompClient?.deactivate(); signalSocket?.disconnect(); });
 
   // Log every public call and any error it throws. Callers (friend.js, room-call.js)
   // often catch errors and only show a status text, so the stack would otherwise be lost.
