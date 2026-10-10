@@ -22,46 +22,69 @@
   let mediaGeneration = 0;
   let cameraTask = null;
   let displayStream = null, savedCameraTrack = null, sharingTask = null;
-  let iceLoaded = false;
+  let meTask = null, iceTask = null, iceExpiresAt = 0;
+  let audioResumeButton = null;
+  const blockedAudios = new Set();
   const peers = new Map();
-  const ICE_CONFIG = {
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:openrelay.metered.ca:80" },
-      {
-        urls: "turn:openrelay.metered.ca:80",
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      },
-      {
-        urls: "turn:openrelay.metered.ca:443",
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      },
-      {
-        urls: "turn:openrelay.metered.ca:443?transport=tcp",
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      },
-    ],
-  };
+  const ICE_CONFIG = { iceServers: [{ urls: "stun:stun.relay.metered.ca:80" }] };
 
   async function loadMe() {
-    if (me?.id) return me;
-    const response = await fetch("/api/users/me", { headers: { Accept: "application/json" }, credentials: "include" });
-    if (!response.ok) throw new Error("ไม่สามารถโหลดข้อมูลผู้ใช้ปัจจุบันได้");
-    me = await response.json();
-    me.id ||= me.userId;
-    if (!iceLoaded) {
-      try {
-        const response = await fetch("/api/call/ice-config", {credentials:"include"});
-        if (response.ok) { const config = await response.json(); if (Array.isArray(config.iceServers) && config.iceServers.length) ICE_CONFIG.iceServers = config.iceServers; }
-      } catch (_) {}
-      iceLoaded = true;
+    if (!me?.id) {
+      if (!meTask) meTask = (async () => {
+        const response = await fetch("/api/users/me", { headers: { Accept: "application/json" }, credentials: "include" });
+        if (!response.ok) throw new Error("ไม่สามารถโหลดข้อมูลผู้ใช้ปัจจุบันได้");
+        const user = await response.json();
+        user.id ||= user.userId;
+        if (!user.id) throw new Error("ไม่พบ user id");
+        me = user;
+      })();
+      try { await meTask; } finally { meTask = null; }
     }
-    if (!me.id) throw new Error("ไม่พบ user id");
     return me;
+  }
+  async function loadIceConfig() {
+    if (Date.now() < iceExpiresAt) return;
+    if (!iceTask) iceTask = (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      try {
+        const response = await fetch("/api/call/ice-config", {credentials:"include", cache:"no-store", signal:controller.signal});
+        if (!response.ok) throw new Error(`โหลดการเชื่อมต่อเสียง/วิดีโอไม่สำเร็จ (HTTP ${response.status}) กรุณาตรวจเซิร์ฟเวอร์ TURN แล้วลองใหม่`);
+        const config = await response.json();
+        if (!Array.isArray(config.iceServers) || !config.iceServers.length) throw new Error("เซิร์ฟเวอร์ยังไม่ได้ตั้งค่าการเชื่อมต่อเสียง/วิดีโอ");
+        ICE_CONFIG.iceServers = config.iceServers;
+        const expires = Date.parse(config.expiresAt);
+        iceExpiresAt = Math.min(Date.now()+60000, Number.isFinite(expires) ? expires-30000 : Infinity);
+      } catch (error) {
+        if (error.name === "AbortError") throw new Error("โหลดการเชื่อมต่อเสียง/วิดีโอนานเกินไป กรุณาลองอีกครั้ง");
+        throw error;
+      } finally { clearTimeout(timer); }
+    })();
+    try { await iceTask; } finally { iceTask = null; }
+  }
+  function hasRelayConfigured() {
+    return ICE_CONFIG.iceServers.some(server => (Array.isArray(server.urls) ? server.urls : [server.urls]).some(url => /^turns?:/i.test(url || "")));
+  }
+  async function getDiagnostics() {
+    // Deliberately omit URLs, addresses, SDP, usernames, credentials and user IDs.
+    const connections = [];
+    for (const {pc} of peers.values()) {
+      const item = {connectionState:pc.connectionState, iceConnectionState:pc.iceConnectionState, signalingState:pc.signalingState, audioPacketsReceived:0, audioBytesReceived:0};
+      try {
+        const stats = await pc.getStats();
+        const transport = [...stats.values()].find(s=>s.type==="transport" && s.selectedCandidatePairId);
+        const pair = transport ? stats.get(transport.selectedCandidatePairId) : [...stats.values()].find(s=>s.type==="candidate-pair" && s.state==="succeeded" && s.nominated);
+        if (pair) {
+          const local=stats.get(pair.localCandidateId), remote=stats.get(pair.remoteCandidateId);
+          item.selectedPair={localType:local?.candidateType,remoteType:remote?.candidateType,protocol:local?.protocol,relayProtocol:local?.relayProtocol};
+        }
+        for (const stat of stats.values()) if(stat.type==="inbound-rtp" && stat.kind==="audio") {
+          item.audioPacketsReceived += stat.packetsReceived || 0; item.audioBytesReceived += stat.bytesReceived || 0;
+        }
+      } catch (_) {}
+      connections.push(item);
+    }
+    return {active:activeCall, mode:currentMode, signalingConnected:!!stompClient?.connected, relayConfigured:hasRelayConfigured(), connections};
   }
   function connectWS(onConnected) {
     if (stompClient?.connected) { onConnected?.(); return; }
@@ -94,16 +117,11 @@
   }
   function wsPublish(destination, body) {
     if (!stompClient?.connected) return false;
-    try {
-      stompClient.publish({ destination, body: JSON.stringify(body) });
-      return true;
-    } catch (err) {
-      console.warn("wsPublish failed:", err);
-      return false;
-    }
+    stompClient.publish({ destination, body: JSON.stringify(body) });
+    return true;
   }
   function publish(destination, body) {
-    if (!wsPublish(destination, body)) console.warn("การเชื่อมต่อระบบโทรขาดหาย ปลายทาง:", destination);
+    if (!wsPublish(destination, body)) throw new Error("การเชื่อมต่อระบบโทรขาดหาย กรุณาลองใหม่");
   }
   function cameraEnabled() {
     return !!localStream?.getVideoTracks().some(track => track.readyState === "live" && track.enabled);
@@ -126,7 +144,31 @@
     if (placeholder) placeholder.style.display = enabled ? "none" : "flex";
     if (enabled) play(video);
   }
+  function updateAudioResume() {
+    for (const audio of blockedAudios) if (!audio.isConnected || !audio.paused) blockedAudios.delete(audio);
+    if (blockedAudios.size && !audioResumeButton) {
+      audioResumeButton = document.createElement("button");
+      audioResumeButton.type = "button"; audioResumeButton.className = "cp-call-audio-resume";
+      audioResumeButton.textContent = "ไม่ได้ยินเสียง? กดเพื่อเปิดเสียงคอล";
+      audioResumeButton.addEventListener("click", () => {
+        // Invoke play synchronously within the user gesture for every blocked peer.
+        for (const audio of [...blockedAudios]) playRemoteAudio(audio);
+      });
+      document.body.append(audioResumeButton);
+    }
+    if (audioResumeButton) audioResumeButton.hidden = !blockedAudios.size;
+  }
+  function playRemoteAudio(audio) {
+    audio.muted = false; audio.volume = 1;
+    const attempt = audio.play();
+    attempt?.then(() => { blockedAudios.delete(audio); updateAudioResume(); }).catch(error => {
+      if (!activeCall || !audio.isConnected) return;
+      if (error.name === "NotAllowedError") { blockedAudios.add(audio); updateAudioResume(); }
+      else if (error.name !== "AbortError") window.dispatchEvent(new CustomEvent("cp-call-error", {detail:{message:"เล่นเสียงจากอีกฝั่งไม่สำเร็จ กรุณาออกจากคอลแล้วเข้าร่วมใหม่"}}));
+    });
+  }
   function showRemoteStream(stream, userId = "default") {
+    if (!stream?.getAudioTracks().some(track => track.readyState === "live")) return;
     let audio = remoteAudios.get(String(userId));
     if (!audio) {
       audio = document.createElement("audio");
@@ -134,7 +176,9 @@
       audio.autoplay = true; audio.setAttribute("aria-hidden", "true"); audio.style.display = "none";
       document.body.append(audio); remoteAudios.set(String(userId), audio);
     }
-    audio.srcObject = stream; play(audio);
+    // Reassigning srcObject during every presence/video refresh interrupts audio.
+    if (audio.srcObject !== stream) audio.srcObject = stream;
+    if (audio.paused) playRemoteAudio(audio);
   }
   function showRemoteVideo(stream, enabled = true) {
     const video = document.getElementById("videoCallRemoteVideo");
@@ -199,7 +243,7 @@
     };
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") window.dispatchEvent(new CustomEvent("cp-call-connected", { detail: { userId: key, mode: currentMode } }));
-      if (pc.connectionState === "failed") window.dispatchEvent(new CustomEvent("cp-call-error", { detail: { message: "เชื่อมต่อสื่อไม่สำเร็จ กรุณาลองโทรใหม่" } }));
+      if (pc.connectionState === "failed") window.dispatchEvent(new CustomEvent("cp-call-error", { detail: { message: hasRelayConfigured() ? "เชื่อมต่อเสียง/วิดีโอไม่สำเร็จ กรุณาตรวจ TURN และเครือข่าย แล้วโทรใหม่" : "เชื่อมต่อเสียง/วิดีโอไม่สำเร็จ เซิร์ฟเวอร์ยังไม่มี TURN สำหรับเครือข่ายที่ต้องใช้ตัวกลาง" } }));
     };
     pc.oniceconnectionstatechange = () => { if (pc.iceConnectionState === "failed") pc.restartIce?.(); };
     pc.onnegotiationneeded = async () => {
@@ -222,7 +266,7 @@
     const entry = peers.get(key);
     if (!entry) return;
     peers.delete(key);
-    const audio = remoteAudios.get(key); if (audio) {audio.srcObject=null; audio.remove(); remoteAudios.delete(key);}
+    const audio = remoteAudios.get(key); if (audio) {audio.srcObject=null; audio.remove(); blockedAudios.delete(audio); remoteAudios.delete(key); updateAudioResume();}
     entry.pc.close();
     refreshMediaViews();
   }
@@ -232,61 +276,25 @@
     if (!currentRoomId || !peers.has(fromUserId)) return;
     if (signal.type === "ICE") {
       if (!signal.payload || entry.ignoreOffer) return;
-      try {
-        const candidate = JSON.parse(signal.payload);
-        if (pc.remoteDescription && pc.remoteDescription.type) {
-          await pc.addIceCandidate(candidate);
-        } else {
-          entry.pendingCandidates.push(candidate);
-        }
-      } catch (err) {
-        if (!entry.ignoreOffer) console.warn("ICE candidate error:", err);
-      }
+      const candidate = JSON.parse(signal.payload);
+      if (pc.remoteDescription) await pc.addIceCandidate(candidate);
+      else entry.pendingCandidates.push(candidate);
       return;
     }
     if (!signal.payload) return;
-    let description;
-    try {
-      description = JSON.parse(signal.payload);
-    } catch (_) {
-      return;
-    }
-
+    const description = JSON.parse(signal.payload);
+    const readyForOffer = !entry.makingOffer && (pc.signalingState === "stable" || entry.isSettingRemoteAnswerPending);
+    const offerCollision = description.type === "offer" && !readyForOffer;
+    entry.ignoreOffer = !entry.polite && offerCollision;
+    if (entry.ignoreOffer) return;
+    entry.isSettingRemoteAnswerPending = description.type === "answer";
+    try { await pc.setRemoteDescription(description); }
+    finally { entry.isSettingRemoteAnswerPending = false; }
     if (description.type === "offer") {
-      const readyForOffer = !entry.makingOffer && (pc.signalingState === "stable" || entry.isSettingRemoteAnswerPending);
-      const offerCollision = !readyForOffer;
-      entry.ignoreOffer = !entry.polite && offerCollision;
-      if (entry.ignoreOffer) return;
-
-      if (offerCollision && entry.polite) {
-        await Promise.all([
-          pc.setLocalDescription({ type: "rollback" }),
-          pc.setRemoteDescription(description)
-        ]);
-      } else {
-        await pc.setRemoteDescription(description);
-      }
       await pc.setLocalDescription();
       if (currentRoomId) publish(`/app/rooms/${currentRoomId}/call`, { type: "ANSWER", targetUserId: fromUserId, payload: JSON.stringify(pc.localDescription) });
-    } else if (description.type === "answer") {
-      if (pc.signalingState !== "have-local-offer") {
-        return;
-      }
-      entry.isSettingRemoteAnswerPending = true;
-      try {
-        await pc.setRemoteDescription(description);
-      } finally {
-        entry.isSettingRemoteAnswerPending = false;
-      }
     }
-
-    for (const candidate of entry.pendingCandidates.splice(0)) {
-      try {
-        await pc.addIceCandidate(candidate);
-      } catch (err) {
-        if (!entry.ignoreOffer) console.warn("Pending candidate error:", err);
-      }
-    }
+    for (const candidate of entry.pendingCandidates.splice(0)) await pc.addIceCandidate(candidate);
     refreshMediaViews();
   }
   function onCallSignal(signal) {
@@ -358,6 +366,8 @@
     currentRoomId = roomId;
     const generation = mediaGeneration;
     try {
+      await loadIceConfig();
+      if (generation !== mediaGeneration) throw new Error("สายนี้สิ้นสุดแล้ว");
       await startMedia(mode);
       await waitForWS();
       if (generation !== mediaGeneration || currentRoomId !== roomId) throw new Error("สายนี้สิ้นสุดแล้ว");
@@ -383,6 +393,7 @@
       const video = document.getElementById(id); if (video) { video.srcObject = null; video.style.display = "none"; }
     }
     for (const audio of remoteAudios.values()) { audio.srcObject = null; audio.remove(); } remoteAudios.clear();
+    blockedAudios.clear(); audioResumeButton?.remove(); audioResumeButton = null;
     currentRoomId = currentMode = currentCallFriendId = null;
     refreshMediaViews();
   }
@@ -456,6 +467,8 @@
     const generation = mediaGeneration;
     try {
       // Ask for device permission before ringing, so failed permissions don't leave the other party waiting.
+      await loadIceConfig();
+      if (generation !== mediaGeneration) throw new Error("สายนี้สิ้นสุดแล้ว");
       await startMedia(currentMode);
       await waitForWS();
       if (generation !== mediaGeneration) throw new Error("สายนี้สิ้นสุดแล้ว");
@@ -468,6 +481,8 @@
     currentRoomId = signal.roomId; currentCallFriendId = signal.fromUserId;
     const generation = mediaGeneration;
     try {
+      await loadIceConfig();
+      if (generation !== mediaGeneration) throw new Error("สายนี้สิ้นสุดแล้ว");
       await startMedia(signal.mode === "VIDEO" ? "VIDEO" : "VOICE");
       await waitForWS();
       if (generation !== mediaGeneration) throw new Error("สายนี้สิ้นสุดแล้ว");
@@ -488,9 +503,10 @@
     const target = signal?.fromUserId || currentCallFriendId;
     const roomId = signal?.roomId || currentRoomId;
     if (!target) return false;
+    const generation = mediaGeneration;
     await loadMe(); await waitForWS();
     publish("/app/call", { type: "CANCEL", toUserId: target, roomId });
-    leaveCall(false);
+    if (!signal && generation === mediaGeneration) leaveCall(false);
     return true;
   }
   function subscribeIncomingCalls() {
@@ -502,6 +518,6 @@
     });
   }
   window.addEventListener("pagehide", () => { leaveCall(); stompClient?.deactivate(); });
-  window.CPCall = { watchTopic, connectWS, wsPublish, loadMe, subscribeIncomingCalls, startMedia, joinRoomCall, leaveCall, toggleMicrophone, toggleCamera, upgradeToVideo, refreshMediaViews, startFriendCall, acceptFriendCall, declineFriendCall, cancelFriendCall, showRemoteVideo,
+  window.CPCall = { getDiagnostics, watchTopic, connectWS, wsPublish, loadMe, subscribeIncomingCalls, startMedia, joinRoomCall, leaveCall, toggleMicrophone, toggleCamera, upgradeToVideo, refreshMediaViews, startFriendCall, acceptFriendCall, declineFriendCall, cancelFriendCall, showRemoteVideo,
     startScreenShare, stopScreenShare, isScreenSharing: () => !!displayStream, getLocalStream: () => localStream, getCurrentRoomId: () => currentRoomId, getCurrentMode: () => currentMode, getCurrentFriendId: () => currentCallFriendId, isActive: () => activeCall, isBusy: () => !!currentRoomId, isCameraEnabled: cameraEnabled };
 })();
